@@ -5,7 +5,7 @@
 //
 // Protocol credit: raffa0001/Peerless_assassin_and_CLI_UI (MIT), reverse-engineered on Linux.
 // CPU temp via PawnIO (https://pawnio.eu, open source, signed) using the same SMN register
-// read as LibreHardwareMonitor / Linux k10temp.
+// read as LibreHardwareMonitor / Linux k10temp. GPU via NVML (NVIDIA) or ADL (AMD).
 //
 // License: MIT
 
@@ -241,7 +241,13 @@ namespace Pa120
         public void Dispose() { if (_h != null) _h.Dispose(); }
     }
 
-    sealed class NvidiaGpu
+    interface IGpu
+    {
+        // Each value is -1 when unavailable.
+        void Read(out int temp, out int usage);
+    }
+
+    sealed class NvidiaGpu : IGpu
     {
         IntPtr _dev;
         DateTime _retryAt;
@@ -288,6 +294,161 @@ namespace Pa120
         }
     }
 
+    // AMD Radeon via ADL (atiadlxx.dll, ships with the AMD driver), the same calls LibreHardwareMonitor uses.
+    // Overdrive 8 (RX 5000 and newer) reads the PM log; older generations use Overdrive N / 6 / 5.
+    sealed class AmdGpu : IGpu
+    {
+        // ADLSensorType indices into the PM log
+        const int PmlogTempEdge = 8, PmlogActivityGfx = 19, PmlogTempHotspot = 27;
+        const int PmlogMaxSensors = 256;
+        const int AsicDiscrete = 1;
+
+        // ADL allocates some results through this callback; keep the delegate alive for the process lifetime.
+        static readonly Native.AdlMalloc Alloc = Marshal.AllocCoTaskMem;
+
+        IntPtr _ctx;
+        int _adapter, _od;
+        DateTime _retryAt;
+        public string Name;
+        public int OverdriveVersion { get { return _od; } }
+
+        public static AmdGpu Open()
+        {
+            var gpu = new AmdGpu();
+            return gpu.Init() ? gpu : null;
+        }
+
+        bool Init()
+        {
+            try
+            {
+                IntPtr ctx;
+                if (Native.ADL2_Main_Control_Create(Alloc, 1, out ctx) != 0) return false;
+                _ctx = ctx;
+                if (PickAdapter()) return true;
+            }
+            catch (DllNotFoundException) { return false; }
+            catch (EntryPointNotFoundException) { }
+            Close();
+            return false;
+        }
+
+        // ADL lists one entry per display output; probe each physical AMD GPU once and prefer a discrete one
+        // over the integrated graphics of a Ryzen CPU.
+        bool PickAdapter()
+        {
+            int count;
+            if (Native.ADL2_Adapter_NumberOfAdapters_Get(_ctx, out count) != 0 || count <= 0) return false;
+            int size = Marshal.SizeOf(typeof(Native.AdapterInfo));
+            IntPtr buf = Marshal.AllocHGlobal(size * count);
+            try
+            {
+                if (Native.ADL2_Adapter_AdapterInfo_Get(_ctx, buf, size * count) != 0) return false;
+                var seen = new List<int>();
+                int bestScore = 0, bestAdapter = 0, bestOd = 0;
+                string bestName = null;
+                for (int i = 0; i < count; i++)
+                {
+                    var info = (Native.AdapterInfo)Marshal.PtrToStructure(buf + i * size, typeof(Native.AdapterInfo));
+                    int bus = info.BusNumber << 16 | info.DeviceNumber << 8 | info.FunctionNumber;
+                    if (info.VendorID != 0x1002 || seen.Contains(bus)) continue;
+                    seen.Add(bus);
+
+                    int supported, enabled, version;
+                    if (Native.ADL2_Overdrive_Caps(_ctx, info.AdapterIndex, out supported, out enabled, out version) != 0) continue;
+                    _adapter = info.AdapterIndex;
+                    _od = version;
+                    int t, u;
+                    if (!TryRead(out t, out u)) continue;
+
+                    int score = 1;
+                    try
+                    {
+                        int types, valids;
+                        if (Native.ADL2_Adapter_ASICFamilyType_Get(_ctx, info.AdapterIndex, out types, out valids) == 0
+                            && (types & valids & AsicDiscrete) != 0) score = 2;
+                    }
+                    catch (EntryPointNotFoundException) { }
+                    if (score > bestScore)
+                    {
+                        bestScore = score; bestAdapter = info.AdapterIndex; bestOd = version;
+                        bestName = (info.AdapterName ?? "").Trim();
+                    }
+                }
+                if (bestScore == 0) return false;
+                _adapter = bestAdapter; _od = bestOd; Name = bestName;
+                return true;
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        // True if at least one value could be read.
+        bool TryRead(out int temp, out int usage)
+        {
+            temp = usage = -1;
+            try
+            {
+                if (_od >= 8)
+                {
+                    // ADLPMLogDataOutput: int size, then { int supported, int value } per sensor
+                    var log = new int[1 + 2 * PmlogMaxSensors];
+                    if (Native.ADL2_New_QueryPMLogData_Get(_ctx, _adapter, log) != 0) return false;
+                    temp = Sensor(log, PmlogTempEdge);
+                    if (temp < 0) temp = Sensor(log, PmlogTempHotspot);
+                    usage = Sensor(log, PmlogActivityGfx);
+                }
+                else if (_od == 7)
+                {
+                    int t;
+                    var status = new int[18]; // ADLODNPerformanceStatus; [6] = iGPUActivityPercent
+                    if (Native.ADL2_OverdriveN_Temperature_Get(_ctx, _adapter, 1, out t) == 0) temp = t / 1000;
+                    if (Native.ADL2_OverdriveN_PerformanceStatus_Get(_ctx, _adapter, status) == 0) usage = status[6];
+                }
+                else if (_od == 6)
+                {
+                    int t;
+                    var status = new int[9]; // ADLOD6CurrentStatus; [2] = iActivityPercent
+                    if (Native.ADL2_Overdrive6_Temperature_Get(_ctx, _adapter, out t) == 0) temp = t / 1000;
+                    if (Native.ADL2_Overdrive6_CurrentStatus_Get(_ctx, _adapter, status) == 0) usage = status[2];
+                }
+                else
+                {
+                    var t = new int[] { 8, 0 };       // ADLTemperature { iSize, iTemperature }
+                    var act = new int[10]; act[0] = 40; // ADLPMActivity; [4] = iActivityPercent
+                    if (Native.ADL2_Overdrive5_Temperature_Get(_ctx, _adapter, 0, t) == 0) temp = t[1] / 1000;
+                    if (Native.ADL2_Overdrive5_CurrentActivity_Get(_ctx, _adapter, act) == 0) usage = act[4];
+                }
+            }
+            catch (EntryPointNotFoundException) { }
+            return temp >= 0 || usage >= 0;
+        }
+
+        static int Sensor(int[] log, int index)
+        {
+            return log[1 + 2 * index] != 0 ? log[2 + 2 * index] : -1;
+        }
+
+        // Reads both values; on failure (e.g. driver update) re-initialises ADL at most every 10s.
+        public void Read(out int temp, out int usage)
+        {
+            temp = usage = -1;
+            if (_ctx == IntPtr.Zero)
+            {
+                if (DateTime.UtcNow < _retryAt) return;
+                _retryAt = DateTime.UtcNow.AddSeconds(10);
+                if (!Init()) return;
+            }
+            if (!TryRead(out temp, out usage)) Close();
+        }
+
+        void Close()
+        {
+            if (_ctx == IntPtr.Zero) return;
+            try { Native.ADL2_Main_Control_Destroy(_ctx); } catch { }
+            _ctx = IntPtr.Zero;
+        }
+    }
+
     // ---------------------------------------------------------------- colors
     static class Palette
     {
@@ -329,6 +490,9 @@ namespace Pa120
     // ---------------------------------------------------------------- app
     static class Program
     {
+        // Bump this to publish a release: the workflow tags v<Version> when it lands on main.
+        const string Version = "1.0.0";
+
         static int Main(string[] args)
         {
             string mode = "temp";       // temp | rainbow | RRGGBB
@@ -343,8 +507,9 @@ namespace Pa120
                     case "--fahrenheit": fahrenheit = true; break;
                     case "--test": test = true; break;
                     case "--once": once = true; break;
+                    case "--version": Console.WriteLine("pa120 " + Version); return 0;
                     default:
-                        Console.WriteLine("usage: pa120 [--color temp|rainbow|RRGGBB] [--interval ms] [--fahrenheit] [--once] [--test]");
+                        Console.WriteLine("usage: pa120 [--color temp|rainbow|RRGGBB] [--interval ms] [--fahrenheit] [--once] [--test] [--version]");
                         return 1;
                 }
             }
@@ -360,6 +525,7 @@ namespace Pa120
             }
             Native.SetPriorityClass(Native.GetCurrentProcess(), Native.BELOW_NORMAL_PRIORITY_CLASS);
             if (!once && !test) OpenLogFile();
+            Log("pa120 " + Version);
 
             Display display = null;
             bool warned = false;
@@ -378,8 +544,16 @@ namespace Pa120
             string err;
             AmdCpuTemp cpuTemp = AmdCpuTemp.Open(Path.Combine(exeDir, "AMDFamily17.bin"), out err);
             Log(cpuTemp != null ? "CPU temp: PawnIO OK" : "CPU temp unavailable: " + err);
-            NvidiaGpu gpu = NvidiaGpu.Open();
-            Log(gpu != null ? "GPU: NVML OK" : "GPU: NVML unavailable");
+            IGpu gpu = NvidiaGpu.Open();
+            if (gpu != null) Log("GPU: NVIDIA via NVML");
+            else
+            {
+                AmdGpu amd = AmdGpu.Open();
+                gpu = amd;
+                Log(amd != null
+                    ? "GPU: AMD " + amd.Name + " via ADL (Overdrive " + amd.OverdriveVersion + ")"
+                    : "GPU unavailable: no NVIDIA (NVML) or AMD (ADL) driver found");
+            }
             var cpuUsage = new CpuUsage();
             cpuUsage.Read();
             Thread.Sleep(200);
@@ -558,5 +732,38 @@ namespace Pa120
         [DllImport("nvml.dll")] public static extern int nvmlDeviceGetHandleByIndex_v2(uint index, out IntPtr dev);
         [DllImport("nvml.dll")] public static extern int nvmlDeviceGetTemperature(IntPtr dev, int sensor, out uint temp);
         [DllImport("nvml.dll")] public static extern int nvmlDeviceGetUtilizationRates(IntPtr dev, out NvmlUtilization util);
+
+        // AMD Display Library. ADL_MAX_PATH = 256; field order is the Windows layout of AdapterInfo.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+        public struct AdapterInfo
+        {
+            public int Size, AdapterIndex;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string UDID;
+            public int BusNumber, DeviceNumber, FunctionNumber, VendorID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string AdapterName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DisplayName;
+            public int Present, Exist;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DriverPath;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string DriverPathExt;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string PNPString;
+            public int OSDisplayIndex;
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate IntPtr AdlMalloc(int size);
+
+        const string Adl = "atiadlxx.dll";
+        [DllImport(Adl)] public static extern int ADL2_Main_Control_Create(AdlMalloc alloc, int enumConnectedAdapters, out IntPtr ctx);
+        [DllImport(Adl)] public static extern int ADL2_Main_Control_Destroy(IntPtr ctx);
+        [DllImport(Adl)] public static extern int ADL2_Adapter_NumberOfAdapters_Get(IntPtr ctx, out int count);
+        [DllImport(Adl)] public static extern int ADL2_Adapter_AdapterInfo_Get(IntPtr ctx, IntPtr info, int size);
+        [DllImport(Adl)] public static extern int ADL2_Adapter_ASICFamilyType_Get(IntPtr ctx, int adapter, out int types, out int valids);
+        [DllImport(Adl)] public static extern int ADL2_Overdrive_Caps(IntPtr ctx, int adapter, out int supported, out int enabled, out int version);
+        [DllImport(Adl)] public static extern int ADL2_New_QueryPMLogData_Get(IntPtr ctx, int adapter, [In, Out] int[] log);
+        [DllImport(Adl)] public static extern int ADL2_OverdriveN_Temperature_Get(IntPtr ctx, int adapter, int type, out int temp);
+        [DllImport(Adl)] public static extern int ADL2_OverdriveN_PerformanceStatus_Get(IntPtr ctx, int adapter, [In, Out] int[] status);
+        [DllImport(Adl)] public static extern int ADL2_Overdrive6_Temperature_Get(IntPtr ctx, int adapter, out int temp);
+        [DllImport(Adl)] public static extern int ADL2_Overdrive6_CurrentStatus_Get(IntPtr ctx, int adapter, [In, Out] int[] status);
+        [DllImport(Adl)] public static extern int ADL2_Overdrive5_Temperature_Get(IntPtr ctx, int adapter, int controller, [In, Out] int[] temp);
+        [DllImport(Adl)] public static extern int ADL2_Overdrive5_CurrentActivity_Get(IntPtr ctx, int adapter, [In, Out] int[] activity);
     }
 }
