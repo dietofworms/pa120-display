@@ -54,11 +54,16 @@ LibreHardwareMonitor use it); remove it from **Settings → Apps** if you don't 
 |-----------|-------------------------------------------------------------------------|--------------------------------|
 | CPU usage | `GetSystemTimes` (Windows API)                                          | nothing                        |
 | GPU temp / usage | `nvml.dll` (ships with the NVIDIA driver)                        | NVIDIA GPU                     |
+| GPU temp / usage | `atiadlxx.dll` (AMD Display Library, ships with the AMD driver), same calls as LibreHardwareMonitor | AMD Radeon GPU |
 | CPU temp  | AMD Zen `Tctl` register (SMN `0x59800`) via the PawnIO driver, same as LibreHardwareMonitor and Linux `k10temp` | PawnIO + admin (the startup task has both) |
 
 The cooler blanks its display a few seconds after it stops receiving frames, so pa120 has to run
 continuously. Only one copy can drive the display at a time; a second one exits immediately.
 The background build writes status to `pa120.log` next to the exe.
+
+NVIDIA is tried first, then AMD. With several AMD GPUs (e.g. a Radeon card plus Ryzen integrated
+graphics), pa120 picks the discrete one. RX 5000 and newer report edge temperature (hotspot if edge
+is missing) and graphics activity; older Radeons use the Overdrive N / 6 / 5 equivalents.
 
 ### About PawnIO
 
