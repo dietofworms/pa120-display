@@ -5,8 +5,25 @@ GPU temp and GPU usage on the cooler's segment display, and does nothing else. I
 
 ## Install
 
-1. Download this repo (**Code → Download ZIP**, or `git clone`) and put the folder somewhere
-   permanent, e.g. `C:\Users\<you>\Developer\pa120-display`. The startup task runs it from there.
+Open PowerShell and run:
+
+```powershell
+irm https://github.com/dietofworms/pa120-display/releases/latest/download/get.ps1 | iex
+```
+
+This downloads the latest release into `%LOCALAPPDATA%\pa120` and runs `install.ps1` from there.
+To pass options, use this form instead:
+
+```powershell
+iex "& { $(irm https://github.com/dietofworms/pa120-display/releases/latest/download/get.ps1) } -Color rainbow"
+```
+
+### Manual install
+
+1. Download the latest release's `pa120.zip` from the
+   [Releases page](https://github.com/dietofworms/pa120-display/releases) (or `git clone` this repo)
+   and extract it into a permanent folder, e.g. `C:\Users\<you>\Developer\pa120-display`.
+   The startup task runs it from there.
 2. Open PowerShell in that folder and run:
 
    ```powershell
@@ -26,24 +43,39 @@ You can uninstall Thermalright's own software; if it keeps running it will fight
 
 ### Options
 
-Re-run `install.ps1` with options any time to change settings:
+Re-run `install.ps1` (or the one-line command) with options any time to change settings. Options you
+leave out keep their current values:
 
 ```powershell
 .\install.ps1 -Color ffffff                     # plain white
 .\install.ps1 -Color rainbow -Interval 100      # animated rainbow
 .\install.ps1 -Color temp                       # default: blue → green → yellow → red by value
 .\install.ps1 -Fahrenheit
+.\install.ps1 -Celsius                          # back from -Fahrenheit
 .\install.ps1 -SkipPawnIO                       # don't offer PawnIO (CPU temp shows ---)
 .\install.ps1 -InstallPawnIO                    # install PawnIO without asking
 ```
 
 `-Color` takes `temp`, `rainbow`, or any hex RGB colour (`ff0000` red, `00ffff` cyan, ...).
 
+### Update
+
+Run the one-line install command again. It downloads the latest release over the old one,
+rebuilds, and keeps your settings. From a manual install or git clone, replace the files
+(or `git pull`) and re-run `install.ps1`.
+
+Installs from before v1.0.0 can switch to the one-line command: it moves the startup task to
+`%LOCALAPPDATA%\pa120` and keeps your settings, and you can delete the old folder afterwards.
+
+`pa120 --version`, or the first line of `pa120.log`, shows the installed version.
+
 ### Uninstall
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
+
+Run it from the install folder (`%LOCALAPPDATA%\pa120` for the one-line install).
 
 Removes the startup task and stops pa120. PawnIO is left installed (other tools such as
 LibreHardwareMonitor use it); remove it from **Settings → Apps** if you don't want it.
@@ -76,7 +108,7 @@ LibreHardwareMonitor; LGPL-2.1, see `AMDFamily17.COPYING.txt`).
 ## Manual use
 
 ```
-pa120 [--color temp|rainbow|RRGGBB] [--interval ms] [--fahrenheit] [--once] [--test]
+pa120 [--color temp|rainbow|RRGGBB] [--interval ms] [--fahrenheit] [--once] [--test] [--version]
 ```
 
 `pa120.exe` is the console build for trying things out; `pa120w.exe` has no window. Stop the

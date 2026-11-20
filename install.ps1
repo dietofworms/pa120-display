@@ -5,11 +5,13 @@
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Color ffffff
 #   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Color rainbow -Interval 100
 #
-# Re-run it any time to change settings. Undo with uninstall.ps1.
+# Re-run it any time to change settings; options you leave out keep their current values.
+# Undo with uninstall.ps1.
 param(
-    [string]$Color = 'temp',          # temp | rainbow | RRGGBB
-    [int]$Interval = 1000,            # ms between updates
+    [string]$Color,                   # temp | rainbow | RRGGBB (default temp)
+    [int]$Interval,                   # ms between updates (default 1000)
     [switch]$Fahrenheit,
+    [switch]$Celsius,                 # switch back from -Fahrenheit
     [switch]$InstallPawnIO,           # install PawnIO without asking
     [switch]$SkipPawnIO,              # never install PawnIO (CPU temp shows ---)
     [switch]$Relaunched               # internal: set when the script re-ran itself elevated
@@ -24,9 +26,11 @@ function Test-Admin {
 
 # Registering an elevated logon task needs admin, so re-run elevated (one UAC prompt).
 if (-not (Test-Admin)) {
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
-                 '-Color', $Color, '-Interval', $Interval, '-Relaunched')
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Relaunched')
+    if ($Color)         { $argList += '-Color', $Color }
+    if ($Interval)      { $argList += '-Interval', $Interval }
     if ($Fahrenheit)    { $argList += '-Fahrenheit' }
+    if ($Celsius)       { $argList += '-Celsius' }
     if ($InstallPawnIO) { $argList += '-InstallPawnIO' }
     if ($SkipPawnIO)    { $argList += '-SkipPawnIO' }
     Start-Process powershell.exe -ArgumentList $argList -Verb RunAs
@@ -35,6 +39,15 @@ if (-not (Test-Admin)) {
 
 try {
     Set-Location $PSScriptRoot
+
+    # Options not given on this run keep their values from the existing startup task, so updating
+    # (re-running this or get.ps1) doesn't reset them.
+    $prev = ''
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($task -and $task.Actions[0].Arguments) { $prev = $task.Actions[0].Arguments }
+    if (-not $Color)    { $Color = if ($prev -match '--color (\S+)') { $Matches[1] } else { 'temp' } }
+    if (-not $Interval) { $Interval = if ($prev -match '--interval (\d+)') { [int]$Matches[1] } else { 1000 } }
+    $useFahrenheit = $Fahrenheit -or (-not $Celsius -and $prev -match '--fahrenheit')
 
     # a running copy locks the exe and would block the rebuild
     Get-Process pa120w, pa120 -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -77,7 +90,7 @@ try {
     }
 
     $runArgs = "--color $Color --interval $Interval"
-    if ($Fahrenheit) { $runArgs += ' --fahrenheit' }
+    if ($useFahrenheit) { $runArgs += ' --fahrenheit' }
 
     Write-Host '== Registering logon task'
     $exe = Join-Path $PSScriptRoot 'pa120w.exe'

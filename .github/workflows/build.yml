@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with the C# compiler built into Windows
+        shell: pwsh
+        run: ./build.ps1
+      - name: Run
+        shell: pwsh
+        run: ./pa120.exe --version
+
+  # Publishes a release when pa120.cs on main has a version that isn't released yet.
+  # Assets: pa120.zip (source + scripts, what get.ps1 downloads) and get.ps1 (the one-line installer).
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(grep -oP 'const string Version = "\K[^"]+' pa120.cs)
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released"
+            exit 0
+          fi
+          git archive --format=zip -o pa120.zip HEAD
+          gh release create "$tag" pa120.zip get.ps1 --target "$GITHUB_SHA" --title "pa120 $version" --generate-notes

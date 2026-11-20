@@ -490,6 +490,9 @@ namespace Pa120
     // ---------------------------------------------------------------- app
     static class Program
     {
+        // Bump this to publish a release: the workflow tags v<Version> when it lands on main.
+        const string Version = "1.0.0";
+
         static int Main(string[] args)
         {
             string mode = "temp";       // temp | rainbow | RRGGBB
@@ -504,8 +507,9 @@ namespace Pa120
                     case "--fahrenheit": fahrenheit = true; break;
                     case "--test": test = true; break;
                     case "--once": once = true; break;
+                    case "--version": Console.WriteLine("pa120 " + Version); return 0;
                     default:
-                        Console.WriteLine("usage: pa120 [--color temp|rainbow|RRGGBB] [--interval ms] [--fahrenheit] [--once] [--test]");
+                        Console.WriteLine("usage: pa120 [--color temp|rainbow|RRGGBB] [--interval ms] [--fahrenheit] [--once] [--test] [--version]");
                         return 1;
                 }
             }
@@ -521,6 +525,7 @@ namespace Pa120
             }
             Native.SetPriorityClass(Native.GetCurrentProcess(), Native.BELOW_NORMAL_PRIORITY_CLASS);
             if (!once && !test) OpenLogFile();
+            Log("pa120 " + Version);
 
             Display display = null;
             bool warned = false;
